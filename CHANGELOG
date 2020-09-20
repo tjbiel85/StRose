@@ -1,0 +1,6 @@
+# 2020-09-20
+- baseline acceptance tests
+    - expected time to complete for a single patient simulation is sum of all average time requirements, with no variation in time requirements
+    - time check for bottlenecked resources (1 each of pre-op, procedure, recovery requiring 30/90/60 minutes) that cannot be relased until the next step starts. Five patients should finish [180, 270, 360, 450, 540].
+- logging
+    - tweaked logging output for human and machine legibility

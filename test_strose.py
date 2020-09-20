@@ -1,7 +1,16 @@
-import strose
 import unittest
 import simpy
+import pandas as pd
 from scipy import stats
+import strose
+
+def run_simulation(unit, env, logger=None):
+    """Assumes patients are in a collection at unit.patients
+    """
+    for p in unit.patients:
+        env.process(unit.provide_care(p))
+        yield env.timeout(0)
+
 
 class TestGaussianRandomHelper(unittest.TestCase):
     """Battery of tests to make sure I don't break the g_rand() helper function"""
@@ -46,54 +55,111 @@ class TestNoWaitSimulation(unittest.TestCase):
     and patients are all the same, and all the patients show up at the
     start of the simulation."""
     
-    def setUp(self, iterations=10000, preop=30, procedure=90, pacu=60, patient_num=5):
-        self.iterations = iterations
-        self.preop_time = {'mu': preop, 'sigma': 0 }
-        self.procedure_time = {'mu': procedure, 'sigma': 0 }
-        self.pacu_time = {'mu': pacu, 'sigma': 0 }
+    def setUp(self, iterations=1000, patient_num=5, time_requirements=[30, 90, 60]):
+        self._iterations = iterations
+        self._patient_num = 5
+        self._units = []
+        self._runtimes = []
         
-        self.patients_start = patient_num
-        self.patients_max = patient_num
-        self.preop_slots = patient_num
-        self.procedure_rooms = patient_num
-        self.pacu_slots = patient_num
+        self._resource_definitions = {
+            'preop_slot' : { 'capacity': self._patient_num },
+            'procedure_room' : { 'capacity': self._patient_num },
+            'recovery_slot' : { 'capacity': self._patient_num }
+        }
+
+        self._activity_definitions = {
+            'preop' : { 'time_requirements': { 'mu': time_requirements[0] }, 'required_resources': ['preop_slot'] },
+            'procedure' : { 'time_requirements': { 'mu': time_requirements[1] }, 'required_resources': ['procedure_room'] },
+            'recovery' : { 'time_requirements': { 'mu': time_requirements[2] }, 'required_resources': ['recovery_slot'] }
+        }
         
-        self.generic_case = strose.Case(
-            self.preop_time,
-            self.procedure_time,
-            self.pacu_time)
+        self._generic_patient_definition = { 'needs_list': ['preop', 'procedure', 'recovery' ] }
+        self._anticipated_runtime = sum(time_requirements)
         
-        self.anticipated_runtime = preop + procedure + pacu
         
-        self.runtimes = []
-        self.units = []
-        for x in range(self.iterations):
+        for i in range(self._iterations):
             env = simpy.Environment()
-            unit = strose.ProceduralUnit(env,
-                                         self.preop_slots,
-                                         self.procedure_rooms,
-                                         self.pacu_slots)
-            env.process(strose.run_simulation(unit, env,
-                                          starting_patients=self.patients_start,
-                                          total_patients=self.patients_max,
-                                          standard_case=self.generic_case))
+            u = strose.SimulatedUnit(env, resources=strose.gen_resource_universe(self._resource_definitions, env))
+
+            for p in range(self._patient_num):
+                u.patients.append(strose.Patient(**self._generic_patient_definition,
+                                          activity_universe=strose.gen_activity_universe(self._activity_definitions, u.resources)))
+
+            env.process(run_simulation(u, env))
             env.run()
-            self.units.append(unit)
-            self.runtimes.append({'iteration': x, 'runtime': env.now})
+
+            self._units.append(u)
+            self._runtimes.append({'iteration': i, 'runtime': env.now})
+        
+    
+    def test_expectedRuntimes(self):
+        """Ensure these multiple patients all finish at the expected time,
+        given that they should never be waiting for Resource requests.
+        """
+        for r in self._runtimes:
+            self.assertEqual(r['runtime'], self._anticipated_runtime)
+    
     
     def test_uniformRuntimes(self):
         """Test whether total run times are uniform, as expected
         when there is no variability, bottlenecks, or waiting."""
-        self.assertTrue(all([x['runtime'] == self.anticipated_runtime for x in self.runtimes]))
+        self.assertTrue(all([r['runtime'] == self._runtimes[0]['runtime'] for r in self._runtimes]))
+
+
+class TestBottleneckedSimulation(unittest.TestCase):
+    """Generate a basic simulation that is bottlenecked by limited Resource.
+    """
+    
+    def setUp(self, iterations=1000):
+        self._time_requirements = [30, 90, 60]
+        self._patient_num = 5
+        self._resource_capacity = 1
+        self._anticipated_finishes = [180, 270, 360, 450, 540]
+
+        self._iterations = 1000
+        self._units = []
+        self._runtimes = []
+        self._finishes = []
+
+        self._resource_definitions = {
+            'preop_slot' : { 'capacity': self._resource_capacity },
+            'procedure_room' : { 'capacity': self._resource_capacity },
+            'recovery_slot' : { 'capacity': self._resource_capacity }
+        }
+
+        self._activity_definitions = {
+            'preop' : { 'time_requirements': { 'mu': self._time_requirements[0] }, 'required_resources': ['preop_slot'] },
+            'procedure' : { 'time_requirements': { 'mu': self._time_requirements[1] }, 'required_resources': ['procedure_room'] },
+            'recovery' : { 'time_requirements': { 'mu': self._time_requirements[2] }, 'required_resources': ['recovery_slot'] }
+        }
+
+        self._generic_patient_definition = { 'needs_list': ['preop', 'procedure', 'recovery' ] }
+
+
+        for i in range(self._iterations):
+            env = simpy.Environment()
+            u = strose.SimulatedUnit(env, resources=strose.gen_resource_universe(self._resource_definitions, env))
+
+            for p in range(self._patient_num):
+                u.patients.append(strose.Patient(**self._generic_patient_definition,
+                                          activity_universe=strose.gen_activity_universe(self._activity_definitions, u.resources)))
+
+            env.process(run_simulation(u, env))
+            env.run()
+
+            self._units.append(u)
+            self._runtimes.append({'iteration': i, 'runtime': env.now})
+            df = pd.DataFrame(strose.extract_event_data(u.patients))
+
+            self._finishes.append(list(df[ df['entry'] == 'recovery:end' ]['timestamp']))
         
-    def test_anticipatedPatientJournalEntries(self):
-        """Test whether patients collect the expected series of journal entries.
-        
-        Should be 1:1 with DEFAULT_EVENT_LABELS entries
+    
+    def test_expectedFinishes(self):
+        """Ensure these patients all finish at the expected time,
+        given the wait for Resource requests.
         """
-        for unit in self.units:
-            for p in unit.patients:
-                self.assertTrue(all([x['entry'] == strose.DEFAULT_EVENT_LABELS[i] for i, x in enumerate(p.journal)]))
+        self.assertTrue(all([f == self._anticipated_finishes for f in self._finishes]))
+        
         
 if __name__ == '__main__':
     unittest.main()
